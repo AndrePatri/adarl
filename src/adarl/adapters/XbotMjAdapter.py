@@ -98,8 +98,13 @@ class XbotMjAdapter(ZmqXbotAdapter, BaseSimulationAdapter):
         jpos_cmd_max_acc_default=0.0,
         enable_filters=True,
         base_link: str = "base_link",
+        root_spawn_height: float | None = None,
         render_to_file: bool = False,
         render_fps: float = 60,
+        sense_timeout_s: float = 2.0,
+        health_check_timeout_s: float = 0.2,
+        health_check_period_s: float = 1.0,
+        health_stale_after_s: float = 5.0,
     ):
         del forced_ros_master_uri, maxObsDelay, blocking_observation
 
@@ -109,6 +114,7 @@ class XbotMjAdapter(ZmqXbotAdapter, BaseSimulationAdapter):
         self._init_steps = init_steps
         self._timeout_ms = timeout_ms
         self._base_link = base_link
+        self._root_spawn_height = root_spawn_height
         self._render_to_file = render_to_file
         self._render_fps = render_fps
         self._xmj_control_health_period_s = 0.5
@@ -150,6 +156,11 @@ class XbotMjAdapter(ZmqXbotAdapter, BaseSimulationAdapter):
             jpos_cmd_max_acc_default=jpos_cmd_max_acc_default,
             enable_filters=enable_filters,
             is_simulated=True,
+            base_link=base_link,
+            sense_timeout_s=sense_timeout_s,
+            health_check_timeout_s=health_check_timeout_s,
+            health_check_period_s=health_check_period_s,
+            health_stale_after_s=health_stale_after_s,
             **zmq_params,
         )
 
@@ -190,11 +201,15 @@ class XbotMjAdapter(ZmqXbotAdapter, BaseSimulationAdapter):
 
         if not self._xmj_sim.reset():
             raise RuntimeError("Failed to reset XBot-MuJoCo simulation")
+        self.move_to_homing_now()
 
         pi = np.zeros((3,), dtype=np.float64)
         qi = np.zeros((4,), dtype=np.float64)
         qi[0] = 1.0
-        pi[2] = self._xmj_sim.p[2]
+        root_z = self._xmj_sim.p[2]
+        if self._root_spawn_height is not None:
+            root_z = float(self._root_spawn_height)
+        pi[2] = root_z
         self._xmj_sim.set_pi(pi)
         self._xmj_sim.set_qi(qi)
 
@@ -202,10 +217,15 @@ class XbotMjAdapter(ZmqXbotAdapter, BaseSimulationAdapter):
             if not self._xmj_sim.step():
                 raise RuntimeError("Failed to warm-start XBot-MuJoCo simulation")
 
-        pi[2] = self._xmj_sim.p[2]
+        if self._root_spawn_height is None:
+            root_z = self._xmj_sim.p[2]
+        pi[2] = root_z
         self._xmj_sim.set_pi(pi)
         if not self._xmj_sim.reset():
             raise RuntimeError("Failed to reset XBot-MuJoCo simulation after warm-start")
+        self._xmj_sim.set_pi(pi)
+        self._xmj_sim.set_qi(qi)
+        self.move_to_homing_now()
 
         self._xmj_sim_jnt_names = self._xmj_sim.jnt_names()
         self._xmj_sim_n_dofs = self._xmj_sim.n_jnts()
@@ -464,6 +484,14 @@ class XbotMjAdapter(ZmqXbotAdapter, BaseSimulationAdapter):
     def _mark_successful_sense(self):
         self._last_successful_sense_wall_time = time.monotonic()
 
+    def move_to_homing_now(self):
+        result = self._xmj_sim.move_to_homing_now()
+        if result is not None:
+            raise RuntimeError(
+                "XBotMjSim.move_to_homing_now returned a value instead of moving joints. "
+                "Rebuild and reinstall xbot2_mujoco to activate the fixed Python binding."
+            )
+
     def xmj_env(self):
         return self._xmj_sim
 
@@ -530,9 +558,9 @@ class XbotMjAdapter(ZmqXbotAdapter, BaseSimulationAdapter):
         self._sense_with_sim_stepping(timeout_s=self._sense_timeout_s)
         imu_name = self._xbot_zmq_client.get_imu_names()[0]
         q_xyzw = self._xbot_zmq_client.getImuOrientation([imu_name])[0]
-        self._base_q_last[:, :] = np.array([[q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]]], dtype=np.float64)
-        self._base_omega_last[:, :] = self._xbot_zmq_client.getImuAngularVelocity([imu_name]).reshape(1, 3)
-        self._base_linacc_last[:, :] = self._xbot_zmq_client.getImuLinearAcceleration([imu_name]).reshape(1, 3)
+        omega_xyz = self._xbot_zmq_client.getImuAngularVelocity([imu_name])[0]
+        linacc_xyz = self._xbot_zmq_client.getImuLinearAcceleration([imu_name])[0]
+        self._update_base_link_state_from_imu(imu_name, q_xyzw, omega_xyz, linacc_xyz)
 
     def get_base_link_state(self):
         return self._base_link, self._base_q_last, self._base_omega_last, self._base_linacc_last

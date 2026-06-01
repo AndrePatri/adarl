@@ -4,7 +4,7 @@ import time
 from typing import Dict, List, Tuple, Union, Optional, Sequence, Mapping, Literal
 
 import adarl.utils.dbg.ggLog as ggLog
-from adarl.utils.utils import JointState, LinkState, RequestFailError, build_1D_vramp_trajectory, MoveFailError, quat_mul_xyzw, th_quat_rotate
+from adarl.utils.utils import JointState, LinkState, RequestFailError, build_1D_vramp_trajectory, MoveFailError, quat_mul_xyzw, th_quat_conj, th_quat_rotate
 from adarl.utils.robot_helpers import Robot
 import numpy as np
 
@@ -127,6 +127,7 @@ class ZmqXbotAdapter(StandaloneRealAdapter, BaseJointImpedanceAdapter, BaseJoint
         self._base_q_last[:, 0] = 1.0
         self._base_omega_last = np.zeros((1, 3), dtype=np.float64)
         self._base_linacc_last = np.zeros((1, 3), dtype=np.float64)
+        self._base_to_imu_quat_cache: dict[str, np.ndarray] = {}
 
         self._xbot_zmq_client = XbotZmqClient(  remote_ip = remote_ip,
                                                 protocol = comm_protocol,
@@ -673,12 +674,59 @@ class ZmqXbotAdapter(StandaloneRealAdapter, BaseJointImpedanceAdapter, BaseJoint
         self._sense_if_needed()
         imu_name = self._xbot_zmq_client.get_imu_names()[0]
         q_xyzw = self._xbot_zmq_client.getImuOrientation([imu_name])[0]
-        self._base_q_last[:, :] = np.array([[q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]]], dtype=np.float64)
-        self._base_omega_last[:, :] = self._xbot_zmq_client.getImuAngularVelocity([imu_name]).reshape(1, 3)
-        self._base_linacc_last[:, :] = self._xbot_zmq_client.getImuLinearAcceleration([imu_name]).reshape(1, 3)
+        omega_xyz = self._xbot_zmq_client.getImuAngularVelocity([imu_name])[0]
+        linacc_xyz = self._xbot_zmq_client.getImuLinearAcceleration([imu_name])[0]
+        self._update_base_link_state_from_imu(imu_name, q_xyzw, omega_xyz, linacc_xyz)
 
     def get_base_link_state(self):
         return self._base_link, self._base_q_last, self._base_omega_last, self._base_linacc_last
+
+    def _get_base_to_imu_quat_xyzw(self, imu_name: str) -> np.ndarray:
+        cached = self._base_to_imu_quat_cache.get(imu_name)
+        if cached is not None:
+            return cached
+
+        if self._base_link == imu_name:
+            quat_xyzw = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            pose_base_to_imu = self._robot_helper.get_frame_poses_xyzxyzw(
+                frames=[self._base_link],
+                reference_frame=imu_name,
+            )[self._base_link]
+            quat_xyzw = np.asarray(pose_base_to_imu[3:7], dtype=np.float64)
+
+        self._base_to_imu_quat_cache[imu_name] = quat_xyzw
+        return quat_xyzw
+
+    def _update_base_link_state_from_imu(
+        self,
+        imu_name: str,
+        q_imu_to_world_xyzw: np.ndarray,
+        omega_imu_local_xyz: np.ndarray,
+        linacc_imu_local_xyz: np.ndarray,
+    ):
+        q_base_to_imu_xyzw = self._get_base_to_imu_quat_xyzw(imu_name)
+
+        q_imu_to_world = th.as_tensor(q_imu_to_world_xyzw, dtype=th.float64)
+        q_base_to_imu = th.as_tensor(q_base_to_imu_xyzw, dtype=th.float64)
+        q_base_to_world = quat_mul_xyzw(q_imu_to_world, q_base_to_imu).cpu().numpy()
+
+        q_imu_to_base = th_quat_conj(q_base_to_imu)
+        omega_base = th_quat_rotate(
+            th.as_tensor(omega_imu_local_xyz, dtype=th.float64),
+            q_imu_to_base,
+        ).cpu().numpy()
+        linacc_base = th_quat_rotate(
+            th.as_tensor(linacc_imu_local_xyz, dtype=th.float64),
+            q_imu_to_base,
+        ).cpu().numpy()
+
+        self._base_q_last[:, :] = np.array(
+            [[q_base_to_world[3], q_base_to_world[0], q_base_to_world[1], q_base_to_world[2]]],
+            dtype=np.float64,
+        )
+        self._base_omega_last[:, :] = omega_base.reshape(1, 3)
+        self._base_linacc_last[:, :] = linacc_base.reshape(1, 3)
     
     def _get_imus_for_links(self, requestedLinks : Sequence[tuple[str,str]]) -> dict[str, str]:
         imus = self._xbot_zmq_client.get_imu_names()
