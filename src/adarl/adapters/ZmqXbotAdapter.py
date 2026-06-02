@@ -167,6 +167,18 @@ class ZmqXbotAdapter(StandaloneRealAdapter, BaseJointImpedanceAdapter, BaseJoint
             self._robot_urdf = _fix_urdf_package_paths(self._xbot_zmq_client.get_urdf())
         self._robot_helper = Robot(robot_description_string=self._robot_urdf)
 
+        missing_impedance_joints = [
+            jn for _, jn in self._jimpedance_controlled_joints
+            if jn not in self._xbotjname_to_jid
+        ]
+        if missing_impedance_joints:
+            requested = [jn for _, jn in self._jimpedance_controlled_joints]
+            raise RuntimeError(
+                "XBot joint list does not match the requested impedance-controlled joints. "
+                f"Missing joints: {missing_impedance_joints}. "
+                f"Requested joints: {requested}. "
+                f"XBot joints: {detected_joint_names}."
+            )
         self._jimpedance_controlled_joints_jids = np.array([self._xbotjname_to_jid[jn] for model_name,jn in self._jimpedance_controlled_joints])
         self._started = True
         self._sense_if_needed()
