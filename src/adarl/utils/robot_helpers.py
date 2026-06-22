@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from __future__ import annotations
+import pprint
 import pinocchio
 import numpy as np
 from pathlib import Path
@@ -158,6 +159,16 @@ class Robot():
             all_pairs += [(g1,g2) for g1 in group for g2 in group]
         return all_pairs
 
+    def get_adjacent_collision_pairs(self) -> list[tuple[str, str]]:
+        """Return geom pairs whose parent joints are directly connected by a joint."""
+        pairs = []
+        for jid in range(1, self._model.njoints):  # skip universe joint at 0
+            parent_jid = self._model.parents[jid]
+            child_geoms = self._joint_to_geoms[self._joint_idx_to_name[jid]]
+            parent_geoms = self._joint_to_geoms[self._joint_idx_to_name[parent_jid]]
+            pairs += [(g1, g2) for g1 in child_geoms for g2 in parent_geoms]
+        return pairs
+
 
     def add_collision_box(self,  pose_xyz_xyzw : np.ndarray,
                                     collision_box_size_xyz : tuple[float,float,float],
@@ -296,6 +307,8 @@ class Robot():
                     ret[frame.name] = link_pose.translation.T, quaternion_xyzw_from_rotmat(link_pose.rotation)
                 if is_reference_frame:
                     ref_pose = link_pose.translation.T, quaternion_xyzw_from_rotmat(link_pose.rotation)
+        if len(ret) != len(frames if frames is not None else self._frame_names):
+            raise RuntimeError(f"Requested frames {frames} but only found poses for {list(ret.keys())}")
         if reference_frame is not None:
             if ref_pose is None:
                 raise RuntimeError(f"Reference frame {reference_frame} not found")
@@ -464,8 +477,9 @@ class Robot():
             # always_present_collisions = always_present_collisions.intersection(set(collisions))
         self.set_joint_pose(original_joint_pose)
         self.set_collision_pairs(original_collision_pairs)
-        # print(f"collision_counters (on {samples}) = {collision_counters}")
-        return {ln for ln, count in collision_counters.items() if count>=samples*threshold}
+        collision_rates = {ln:count/samples for ln,count in collision_counters.items()}
+        # print(f"collision_rates (on {samples}) = {pprint.pformat(sorted(collision_rates.items(), key=lambda x:x[1], reverse=True))}")
+        return {ln for ln, rate in collision_rates.items() if rate>=threshold}
 
 
 

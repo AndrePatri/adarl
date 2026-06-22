@@ -2,7 +2,7 @@ from __future__ import annotations
 import functools
 import math
 
-from adarl.utils.dbg.dbg_checks import dbg_check_size
+from adarl.utils.dbg.dbg_checks import dbg_check_size, dbg_check
 import numpy as np
 import time
 from typing import List, Tuple, Callable, Dict, Union, Optional, Any, Optional, TypeVar, Sequence
@@ -900,6 +900,31 @@ def quat_xyzw_between_vecs_py(v1 : th.Tensor, v2 : th.Tensor):
 # def quat_xyzw_between_vecs(v1 : th.Tensor, v2 : th.Tensor):
 #     return quat_xyzw_between_vecs_py(v1,v2)
 
+def average_two_quaternions(q0, q1, eps=1e-6, antipodal : th.Tensor | None = None):
+    """
+    Weighted midpoint of two unit quaternions (= SLERP midpoint = Markley
+    average for N=2 in the equal-weight case; weighted nlerp otherwise).
+
+    q0, q1: (..., 4) unit quaternions, consistent component order.
+    w0, w1: scalars or (...,) tensors broadcasting over the batch.
+    returns: (..., 4) averaged unit quaternion.
+    """
+    # double-cover guard: flip q1 into q0's hemisphere
+    dot = (q0 * q1).sum(-1, keepdim=True)
+    q1 = torch.where(dot < 0, -q1, q1)
+    
+    q = q0 + q1
+    n = q.norm(dim=-1, keepdim=True)
+
+    # antipodal guard: near-zero norm ⇒ frames ~180° apart ⇒ ambiguous
+    is_antipodal = n < eps
+    dbg_check(is_antipodal, build_msg=lambda: f"Antipodal quaternions detected in average_two_quaternions.",
+              async_assert=True)
+    q = torch.where(is_antipodal, q0, q / n.clamp_min(eps))
+
+    # pin sign for gradient continuity, same convention as before
+    q = q * torch.sign(q[..., -1:] + (q[..., -1:] == 0))
+    return q
 
 
 import adarl.adapters.BaseAdapter
@@ -1016,3 +1041,232 @@ def get_func_input_args(exclude : list[str] = []) -> dict:
     for name in exclude:
         values.pop(name, None)
     return values
+
+
+def sample_distr(size, distribution : DistributionDefTh, device : th.device, dtype : th.dtype, generator : th.Generator) -> th.Tensor:
+    if isinstance(distribution, th.Tensor):
+        return distribution.expand(size).clone()
+    elif distribution[0] == "uniform":
+        low, high = distribution[1] #type: ignore
+        return th.rand(size, device=device, dtype=dtype, generator=generator)*(high-low)+low
+    elif distribution[0] == "loguniform":
+        low, high = distribution[1] #type: ignore
+        lowlog = th.log(low)
+        highlog = th.log(high)
+        return th.exp(th.rand(size, device=device, dtype=dtype, generator=generator)*(highlog-lowlog)+lowlog)
+    elif distribution[0] == "normal":
+        if len(distribution[1]) == 2:
+            mean, std = distribution[1]
+            clamp_width = th.tensor(5.0, device=device, dtype=dtype)
+        else:
+            mean, std, clamp_width = distribution[1] #type: ignore
+        return th.clamp(th.randn(size, device=device, dtype=dtype, generator=generator), -clamp_width, clamp_width)*std+mean
+    else:
+        raise NotImplementedError(f"Unsupported distribution type {distribution[0]}")
+    
+
+
+TensorLike = Union[th.Tensor, float, List[float]]
+DistributionDef = Union[Tuple[str,Tuple[TensorLike, ...]], TensorLike]
+DistributionDefTh = Union[Tuple[str,Tuple[th.Tensor, ...]], th.Tensor]
+
+class DistributionTh:
+    DistributionDef = Union[Tuple[str,Tuple[TensorLike, ...]], TensorLike]
+
+    def __init__(self,  distribution_def : DistributionTh.DistributionDef,
+                        device : th.device,
+                        dtype : th.dtype,
+                        generator : th.Generator | None = None):
+        if isinstance(distribution_def, (float,th.Tensor, np.ndarray)) or not isinstance(distribution_def[0], str):
+            distribution_def = ("constant", distribution_def) #type: ignore
+        distrtype : str = distribution_def[0]
+        distrparams : Sequence = distribution_def[1]
+        self._device = device
+        self._dtype = dtype
+        self._type = distrtype
+        self._params = tuple(th.as_tensor(p, device=device, dtype=dtype) for p in distrparams)
+        self._rng = generator
+
+    def sample(self,    size, 
+                        device : th.device | None = None, 
+                        dtype : th.dtype | None = None, 
+                        generator : th.Generator | None = None) -> th.Tensor:
+        if device is None:
+            device = self._device
+        if dtype is None:
+            dtype = self._dtype
+        if generator is None:
+            generator = self._rng
+        if self._type == "constant":
+            return self._params[0].expand(size).clone()
+        elif self._type == "uniform":
+            low, high = self._params
+            return th.rand(size, device=device, dtype=dtype, generator=generator)*(high-low)+low
+        elif self._type == "loguniform":
+            low, high = self._params
+            lowlog = th.log(low)
+            highlog = th.log(high)
+            return th.exp(th.rand(size, device=device, dtype=dtype, generator=generator)*(highlog-lowlog)+lowlog)
+        elif self._type == "normal":
+            if len(self._params) == 2:
+                mean, std = self._params
+                clamp_width = th.tensor(5.0, device=device, dtype=dtype)
+            else:
+                mean, std, clamp_width = self._params #type: ignore
+            return th.clamp(th.randn(size, device=device, dtype=dtype, generator=generator), -clamp_width, clamp_width)*std+mean
+        else:
+            raise NotImplementedError(f"Unsupported distribution type {self._type}")
+        
+def distr_is_constant(distr : DistributionDef) -> bool:
+    if isinstance(distr, (th.Tensor, float, int)):
+        return True
+    else:
+        distr_type = distr[0]
+        if isinstance(distr_type, (float, int)):
+            return True # Then it must be a list of numbers, thus a constant distribution
+        else:
+            if distr_type == "uniform" or distr_type == "loguniform":
+                low, high = distr[1]
+                return th.all(th.as_tensor(low) == th.as_tensor(high)).item()
+            elif distr_type == "normal":
+                if len(distr[1]) == 2:
+                    mean, std = distr[1]
+                else:
+                    mean, std, _ = distr[1]
+                return th.all(th.as_tensor(std) == 0).item()
+            else:
+                raise NotImplementedError(f"Unsupported distribution type {distr_type}")
+    
+    
+def distr_to_tensor(distr : DistributionDef, size : tuple[int,...] | None = None, device : th.device | None = None,
+                    dtype : th.dtype | None = None) -> DistributionDefTh:
+    if isinstance(distr, (float, int, th.Tensor)):
+        return th.as_tensor(distr, device=device, dtype=dtype)
+    else:
+        distr_type = distr[0]
+        if isinstance(distr_type, str):
+            if size is not None:
+                distr_params = tuple(th.as_tensor(t, device=device, dtype=dtype).expand(size) for t in distr[1])
+            else:
+                distr_params = tuple(th.as_tensor(t, device=device, dtype=dtype) for t in distr[1])            
+            return distr_type, distr_params
+        else:
+            return th.as_tensor(distr, device=device, dtype=dtype)
+
+@staticmethod
+def sample_distr(size, distribution : DistributionDefTh, device : th.device, dtype : th.dtype, generator : th.Generator) -> th.Tensor:
+    if isinstance(distribution, th.Tensor):
+        return distribution.expand(size).clone()
+    elif distribution[0] == "uniform":
+        low, high = distribution[1] #type: ignore
+        return th.rand(size, device=device, dtype=dtype, generator=generator)*(high-low)+low
+    elif distribution[0] == "loguniform":
+        low, high = distribution[1] #type: ignore
+        lowlog = th.log(low)
+        highlog = th.log(high)
+        return th.exp(th.rand(size, device=device, dtype=dtype, generator=generator)*(highlog-lowlog)+lowlog)
+    elif distribution[0] == "normal":
+        if len(distribution[1]) == 2:
+            mean, std = distribution[1]
+            clamp_width = th.tensor(5.0, device=device, dtype=dtype)
+        else:
+            mean, std, clamp_width = distribution[1] #type: ignore
+        return th.clamp(th.randn(size, device=device, dtype=dtype, generator=generator), -clamp_width, clamp_width)*std+mean
+    else:
+        raise NotImplementedError(f"Unsupported distribution type {distribution[0]}")
+
+KEY = TypeVar('KEY')
+def expand_default_dict(d : Mapping[KEY | str, float] | float,
+                        keys: Sequence[KEY],
+                        default_key: str = "default") -> dict[KEY, float]:
+    """ Expand the input into a dict with all the specified key populated. If the input is already a dict,
+        it should contain either the joint name as key or a "default" key for default values. If the input
+        is a float, it is used for all joints."""
+    if isinstance(d, float):
+        expanded_d = {k: d for k in keys}
+    elif isinstance(d, dict):
+        try:
+            expanded_d = {k: d.get(k, d[default_key]) for k in keys}
+        except KeyError as e:
+            raise RuntimeError(f"Missing default value, provided dict is {d}") from e
+    else:
+        raise RuntimeError(f"Unexpected type: {type(d)}, expected float or dict")
+    return expanded_d
+
+import dataclasses
+_Struct = TypeVar("_Struct")  # a dict or a dataclass instance
+def override_struct(struct1: _Struct, struct2: Any) -> _Struct:
+    """Recursively override values in ``struct1`` with those from ``struct2``, in place.
+
+    Both arguments are nested structures made of dicts and/or dataclass instances.
+    ``struct2`` acts as a sparse "patch": for every key/field it defines, the
+    corresponding entry in ``struct1`` is replaced, while keys absent from ``struct2``
+    are left untouched.
+
+    The two structures need not use the same container types at corresponding levels:
+    a field that is a dataclass in ``struct1`` may be overridden by a dict in
+    ``struct2`` (and vice-versa). Whenever both the existing value and the override
+    value are themselves structures, the override is applied recursively, so nested
+    dataclasses can be patched with partial dicts.
+
+    Overriding is restricted to keys that already exist in ``struct1``; new fields are
+    never created. This catches typos in the override and avoids setting phantom
+    attributes on dataclasses that would not be real fields.
+
+    Parameters
+    ----------
+    struct1 : dict or dataclass instance
+        The structure to be mutated. Modified in place.
+    struct2 : dict or dataclass instance
+        The structure holding the override values.
+
+    Returns
+    -------
+    dict or dataclass instance
+        ``struct1``, after being mutated, returned for convenience.
+
+    Raises
+    ------
+    KeyError
+        If ``struct2`` contains a key/field that does not exist at the corresponding
+        level of ``struct1``.
+    """
+    if struct2 is None:
+        return struct1
+    
+    def is_struct(obj):
+        return isinstance(obj, dict) or (dataclasses.is_dataclass(obj) and not isinstance(obj, type))
+
+    def keys_of(obj):
+        if isinstance(obj, dict):
+            return list(obj.keys())
+        return [f.name for f in dataclasses.fields(obj)]
+
+    def has_key(obj, key):
+        if isinstance(obj, dict):
+            return key in obj
+        return any(f.name == key for f in dataclasses.fields(obj))
+
+    def get_value(obj, key):
+        if isinstance(obj, dict):
+            return obj[key]
+        return getattr(obj, key)
+
+    def set_value(obj, key, value):
+        if isinstance(obj, dict):
+            obj[key] = value
+        else:
+            setattr(obj, key, value)
+
+    for key in keys_of(struct2):
+        new_value = get_value(struct2, key)
+        if not has_key(struct1, key):
+            raise KeyError(f"override key {key!r} not present in struct1 "
+                           f"(type {type(struct1).__name__}); cannot override a non-existing field")
+        old_value = get_value(struct1, key)
+        if is_struct(old_value) and is_struct(new_value):
+            # Recurse so a dict in struct2 can override a dataclass (or dict) in struct1
+            override_struct(old_value, new_value)
+        else:
+            set_value(struct1, key, new_value)
+    return struct1

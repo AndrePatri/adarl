@@ -4,7 +4,7 @@ from adarl.adapters.MujocoAdapter import MujocoAdapter
 import heapq
 import numpy as np
 import torch as th
-from typing import Sequence
+from typing import Sequence, Any
 from typing_extensions import override
 from adarl.adapters.BaseVecJointImpedanceAdapter import BaseVecJointImpedanceAdapter
 
@@ -23,7 +23,7 @@ class ExponentialFilter:
         v = np.array(value, dtype=np.float32)
         self.state = self.state * self.alpha + v * (1.0 - self.alpha)
         return self.state
-    
+
     @staticmethod
     def _decimation_alpha(sim_step_dt: float, decimation_time: float) -> float:
         if decimation_time <= 0:
@@ -69,26 +69,48 @@ class SecondOrderFilter:
 
 
 class MujocoJointImpedanceAdapter(MujocoAdapter, BaseVecJointImpedanceAdapter):
-    """Joint impedance controller built on top of the MujocoAdapter (classic mujoco, vec_size=1)."""
+    """Joint impedance controller built on top of the MujocoAdapter (mujoco classic, only vec_size=1).
+
+    WARNING: This adapter should still be considered as a Work In Progress."""
 
     def __init__(self,
                  vec_size: int = 1,
                  sim_step_dt: float = 2 / 1024,
                  step_length_sec: float = 48 / 1024,
                  output_th_device: th.device = th.device("cpu"),
+                 log_folder: str = "./",
+                 show_gui: bool = False,
+                 gui_frequency: float = 25.0,
+                 opt_preset: str = "mujoco_default",
+                 opt_override: dict | None = None,
+                 safe_revolute_dof_armature: float = 0.01,
+                 revolute_dof_armature_override: float | None = None,
+                 revolute_dof_damping_override: float | None = None,
+                 revolute_dof_frictionloss_override: float | None = None,
                  default_max_joint_impedance_ctrl_torque: float = 100.0,
                  max_joint_impedance_ctrl_torques: dict[tuple[str, str], float] | None = None,
                  reference_filter_cutoff_frequency: float = 20.0,
                  reference_filter_mode: str = "second_order",
                  reference_exp_filter_decimation_time: float = 0.05,
-                 joint_state_filter_decimation_time: float | None = 0.005,
+                 joint_state_filter_decimation_time: float | None = None,
                  gains_exp_filter_decimation_time: float = 0.05,
                  gains_filter_cutoff_frequency: float = 20.0,
-                 use_gains_filter: bool = False):
+                 use_gains_filter: bool = False,
+                 geom_overrides : dict[str,Any] | None = None):
         super().__init__(vec_size=vec_size,
                          sim_step_dt=sim_step_dt,
                          step_length_sec=step_length_sec,
-                         output_th_device=output_th_device)
+                         output_th_device=output_th_device,
+                         log_folder=log_folder,
+                         show_gui=show_gui,
+                         gui_frequency=gui_frequency,
+                         opt_preset=opt_preset,
+                         opt_override=opt_override,
+                         safe_revolute_dof_armature=safe_revolute_dof_armature,
+                         revolute_dof_armature_override=revolute_dof_armature_override,
+                         revolute_dof_damping_override=revolute_dof_damping_override,
+                         revolute_dof_frictionloss_override=revolute_dof_frictionloss_override,
+                         geom_overrides=geom_overrides)
         self._max_torque_default = default_max_joint_impedance_ctrl_torque
         self._max_torque_overrides = max_joint_impedance_ctrl_torques or {}
         self._imp_ctrl_joints: list[tuple[str, str]] = []
@@ -97,6 +119,8 @@ class MujocoJointImpedanceAdapter(MujocoAdapter, BaseVecJointImpedanceAdapter):
         self._cmd_queue: list[tuple[float, int, np.ndarray]] = []
         self._cmd_queue_counter = 0
         self._control_period_th = th.as_tensor(step_length_sec, device=self._out_th_device, dtype=self._out_th_float_dtype)
+        self._reference_filter_mode = reference_filter_mode
+        self._reference_filter_cutoff_frequency = reference_filter_cutoff_frequency
         if reference_filter_mode == "second_order":
             self._ref_filter = SecondOrderFilter(self._sim_step_dt, reference_filter_cutoff_frequency)
             if use_gains_filter:
@@ -146,7 +170,7 @@ class MujocoJointImpedanceAdapter(MujocoAdapter, BaseVecJointImpedanceAdapter):
         expected_len = len(self._imp_ctrl_joints)
         if joint_impedances_pvesd.shape[1] != expected_len or joint_impedances_pvesd.shape[2] != 5:
             raise ValueError(f"joint_impedances_pvesd has wrong shape {tuple(joint_impedances_pvesd.shape)}, expected (1,{expected_len},5)")
-            
+
         d = delay_sec.item() if isinstance(delay_sec, th.Tensor) else float(delay_sec)
         cmd_time = self.getEnvTimeFromStartup() + max(0.0, d)
         self._enqueue_command(cmd_time, joint_impedances_pvesd.cpu().numpy())
@@ -183,7 +207,25 @@ class MujocoJointImpedanceAdapter(MujocoAdapter, BaseVecJointImpedanceAdapter):
     @override
     def control_period(self) -> th.Tensor:
         return self._control_period_th
-        
+
+    @override
+    def set_reference_filter(self, reference_filter_cutoff_frequency : th.Tensor, vec_mask : th.Tensor | None = None):
+        # vec_size is always 1 for this adapter, so the cutoff is a single scalar.
+        if vec_mask is not None and not bool(vec_mask.flatten()[0].item()):
+            return
+        cutoff = float(th.as_tensor(reference_filter_cutoff_frequency).flatten()[0].item())
+        self._reference_filter_cutoff_frequency = cutoff
+        if cutoff <= 0.0 or self._reference_filter_mode == "none":
+            self._ref_filter = None
+        elif self._reference_filter_mode == "exponential":
+            # One-pole low-pass: alpha placing the -3dB cutoff at the requested frequency.
+            alpha = float(np.exp(-2.0 * np.pi * cutoff * self._sim_step_dt))
+            self._ref_filter = ExponentialFilter(alpha)
+        else:  # "second_order"
+            self._ref_filter = SecondOrderFilter(self._sim_step_dt, cutoff)
+        if self._ref_filter is not None and self._mj_data is not None and len(self._imp_ctrl_joints) > 0:
+            self._ref_filter.reset(self._current_cmd[0][:, :3])
+
     def _apply_commands(self):
         self._apply_impedance_torques()
         super()._apply_commands()
@@ -222,14 +264,14 @@ class MujocoJointImpedanceAdapter(MujocoAdapter, BaseVecJointImpedanceAdapter):
             return fq[:, 0], fq[:, 1]
         else:
             return qpos, qvel
-    
+
     def _filter_references(self, pos_ref: np.ndarray, vel_ref: np.ndarray, eff_ref: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self._ref_filter is not None:
             filtered_refs = self._ref_filter.apply(np.stack((pos_ref, vel_ref, eff_ref), axis=1))
             return filtered_refs[:, 0], filtered_refs[:, 1], filtered_refs[:, 2]
         else:
             return pos_ref, vel_ref, eff_ref
-    
+
     def _filter_gains(self, kp:  np.ndarray, kd: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if self._gains_filter is not None:
             gains = np.stack((kp, kd), axis=1)
@@ -248,7 +290,7 @@ class MujocoJointImpedanceAdapter(MujocoAdapter, BaseVecJointImpedanceAdapter):
         all_qvel = self._mj_data.qvel # type: ignore
         ctrl_qpos = all_qpos[self._mj_model.jnt_qposadr[self._imp_ctrl_jids]].astype(np.float32)
         ctrl_qvel = all_qvel[self._mj_model.jnt_dofadr[self._imp_ctrl_jids]].astype(np.float32)
-        
+
         current_cmd_j_pvesd = self._current_cmd[0]
         if self._joint_state_filter is not None:
             self._joint_state_filter.reset(np.stack((ctrl_qpos, ctrl_qvel), axis=1))

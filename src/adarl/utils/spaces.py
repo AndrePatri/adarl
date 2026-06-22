@@ -7,7 +7,7 @@ import numpy as np
 import torch as th
 gym_spaces = gym.spaces
 from copy import deepcopy
-from gymnasium.vector.utils.spaces import batch_space
+from gymnasium.vector.utils import batch_space
 from adarl.utils.utils import torch_to_numpy_dtype_dict, numpy_to_torch_dtype_dict
 import adarl.utils.dbg.ggLog as ggLog
 from collections import OrderedDict
@@ -122,9 +122,19 @@ class ThBox(gym.spaces.Box):
         if isinstance(self.labels,np.ndarray):
             state["labels"] = self.labels.tolist()
         state.pop("dtype", None)
+
+        rng_state = self._th_rng.get_state().tolist()
+        rng_device = self._th_rng.device
+        state.pop("_th_rng", None)
+        state["_th_rng_state"] = rng_state
+        state["_th_rng_device"] = rng_device
+
         return state
     
     def __setstate__(self, state):
+        if "_th_rng" not in state:
+            state["_th_rng"] = th.Generator(device=state["_th_rng_device"])
+            state["_th_rng"].set_state(th.ByteTensor(state["_th_rng_state"]))
         self.__dict__.update(state)
         self.dtype = torch_to_numpy_dtype_dict[getattr(th,self.torch_dtype_str)]
         if isinstance(self.high,list):
@@ -143,6 +153,13 @@ class ThBox(gym.spaces.Box):
             self.low = th.as_tensor(self.low).cpu().numpy()
         if isinstance(self.labels,list):
             self.labels = np.array(self.labels, dtype=object)
+
+    def seed(self, seed: int | None = None) -> list[int]:
+        """Seed the PRNG of this space and possibly the PRNGs of subspaces."""
+        if seed is not None:
+            self._th_rng.manual_seed(seed)
+        return super().seed(seed)
+
 
 def get_space_labels(space : gym_spaces.Dict | ThBox):
     if isinstance(space, ThBox):
@@ -183,7 +200,8 @@ class ThDict(gym_spaces.Dict):
         if isinstance(seed, int):
             seeds = [seed]
             self._th_rng.manual_seed(seed)
-            subseeds = th.randint(0, np.iinfo(np.int32).max, (len(self.spaces),), generator=self._th_rng).tolist()
+            subseeds = th.randint(0, np.iinfo(np.int32).max, (len(self.spaces),), generator=self._th_rng,
+                                  device=th.device("cpu")).tolist()
             for subspace, subseed in zip(self.spaces.values(), subseeds):
                 seeds += subspace.seed(int(subseed))
             return seeds
