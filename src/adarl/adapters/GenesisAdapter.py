@@ -188,6 +188,7 @@ class GenesisAdapter(BaseVecSimulationAdapter, BaseVecJointEffortAdapter):
                  show_gui: bool = False,
                  sim_options_override: dict[str, Any] | None = None,
                  rigid_options_override: dict[str, Any] | None = None,
+                 vis_options_override: dict[str, Any] | None = None,
                  genesis_logging_level: str = "info",
                  enable_model_randomization: bool = True,
                  log_folder: str = "./",
@@ -206,6 +207,7 @@ class GenesisAdapter(BaseVecSimulationAdapter, BaseVecJointEffortAdapter):
         self._show_gui = show_gui
         self._sim_options_override = dict(sim_options_override) if sim_options_override else {}
         self._rigid_options_override = dict(rigid_options_override) if rigid_options_override else {}
+        self._vis_options_override = dict(vis_options_override) if vis_options_override else {}
         self._log_folder = log_folder
         self._sim_step_dt_th = th.as_tensor(self._sim_step_dt, device=self._out_th_device)
 
@@ -248,6 +250,12 @@ class GenesisAdapter(BaseVecSimulationAdapter, BaseVecJointEffortAdapter):
             raise RuntimeError("Scenario is not built. Call build_scenario() first.")
         return self._scene.rigid_solver
 
+    def set_global_sol_params(self, sol_params):
+        """Set the default contact constraint parameters for all geoms (MuJoCo solref+solimp).
+        sol_params is the 7-vector [timeconst, dampratio, dmin, dmax, width, mid, power].
+        Must be called after build_scenario()."""
+        self._rigid_solver().set_global_sol_params(sol_params)
+
     # =================================================================================
     #                                 scenario building
     # =================================================================================
@@ -268,12 +276,7 @@ class GenesisAdapter(BaseVecSimulationAdapter, BaseVecJointEffortAdapter):
                 renderer = gs.options.renderers.Rasterizer()
         else:
             renderer = None
-        if self._render_envs_idx_arg is not None:
-            self._rendered_envs_idx = [int(i) for i in self._render_envs_idx_arg if 0 <= int(i) < self._vec_size]
-            if len(self._rendered_envs_idx) == 0:
-                self._rendered_envs_idx = [0]
-        else:
-            self._rendered_envs_idx = [0]
+        self._rendered_envs_idx = self._sanitize_rendered_envs_idx(self._render_envs_idx_arg)
         self._scene = gs.Scene(sim_options=gs.options.SimOptions(dt=self._sim_step_dt,
                                                                  substeps=1,
                                                                  **self._sim_options_override),
@@ -476,6 +479,10 @@ class GenesisAdapter(BaseVecSimulationAdapter, BaseVecJointEffortAdapter):
         scale = float(model_kwargs.pop("genesis_scale", 1.0))
         gravity_compensation = float(model_kwargs.pop("genesis_gravity_compensation", 0.0))
         morph_kwargs = dict(model_kwargs.pop("genesis_morph_kwargs", {}))
+        # rendering: vis_mode selects visual vs collision geometry; visualize_contact draws
+        # per-link contact-force arrows (scaled by VisOptions.contact_force_scale).
+        vis_mode = model_kwargs.pop("genesis_vis_mode", None)
+        visualize_contact = bool(model_kwargs.pop("genesis_visualize_contact", False))
         definition = model.definition_string
         if fmt.endswith("xacro"):
             definition = compile_xacro_string(model_definition_string=definition, model_kwargs=model_kwargs)
@@ -511,7 +518,8 @@ class GenesisAdapter(BaseVecSimulationAdapter, BaseVecJointEffortAdapter):
                                    **morph_kwargs)
         else:
             raise RuntimeError(f"Unsupported model format '{model.format}' for model '{model.name}'")
-        return self._scene.add_entity(morph, material=material, name=model.name), cam_specs
+        return self._scene.add_entity(morph, material=material, name=model.name,
+                                      vis_mode=vis_mode, visualize_contact=visualize_contact), cam_specs
 
     @override
     def destroy_scenario(self, **kwargs):
@@ -925,19 +933,59 @@ class GenesisAdapter(BaseVecSimulationAdapter, BaseVecJointEffortAdapter):
         """Rigid options for the scene, enabling per-environment batched model info when model
         randomization is on (required for alter_model). Explicit overrides win."""
         opts = dict(self._rigid_options_override)
+        # allow string values for enum-typed options so callers don't need to import genesis
+        # (e.g. constraint_solver="Newton"/"CG", integrator="approximate_implicitfast"/"implicitfast"/"Euler")
+        enum_fields = {"constraint_solver": gs.constraint_solver,
+                       "integrator": gs.integrator,
+                       "broadphase_traversal": gs.broadphase_traversal}
+        for field, enum in enum_fields.items():
+            val = opts.get(field)
+            if isinstance(val, str):
+                opts[field] = getattr(enum, val)
         if self._enable_model_randomization:
             opts.setdefault("batch_links_info", True)
             opts.setdefault("batch_dofs_info", True)
         return opts
 
+    def _sanitize_rendered_envs_idx(self, envs_idx: Sequence[int] | None) -> list[int]:
+        if envs_idx is None:
+            return [0]
+        clean = [int(i) for i in envs_idx if 0 <= int(i) < self._vec_size]
+        return clean if clean else [0]
+
+    def set_rendered_envs_idx(self, envs_idx: Sequence[int]) -> None:
+        """Select which vectorized environments are shown/rendered.
+
+        Genesis builds the rasterizer scene with len(rendered_envs_idx) render slots.
+        After build we only allow same-count switches, e.g. [0] -> [17].
+        """
+        new_idx = self._sanitize_rendered_envs_idx(envs_idx)
+        if self._scene is not None and len(new_idx) != len(self._rendered_envs_idx):
+            raise RuntimeError("Changing the number of rendered Genesis envs after build is not supported. "
+                               "Switch between lists with the same length, or rebuild the scene.")
+        self._render_envs_idx_arg = list(new_idx)
+        self._rendered_envs_idx = list(new_idx)
+        if self._scene is None:
+            return
+        visualizer = getattr(self._scene, "visualizer", None)
+        context = getattr(visualizer, "context", None) if visualizer is not None else None
+        if context is None or not hasattr(context, "rendered_envs_idx"):
+            return
+        lock = getattr(visualizer, "viewer_lock", None)
+        if lock is None:
+            context.rendered_envs_idx = list(new_idx)
+        else:
+            with lock:
+                context.rendered_envs_idx = list(new_idx)
+
     def _build_vis_options(self):
-        """Visualization options. When rendering, env_separate_rigid makes each environment render in
-        isolation: otherwise the renderer draws every env into a single image and, with the default zero
-        env spacing, they overlap into a pile of stacked robots. rendered_envs_idx limits how many envs
-        are rendered (separating every env is expensive), defaulting to env 0 (what the ui/eval camera uses)."""
-        if self._enable_rendering:
-            return gs.options.vis.VisOptions(env_separate_rigid=True, rendered_envs_idx=self._rendered_envs_idx)
-        return gs.options.vis.VisOptions()
+        """Visualization options. env_separate_rigid isolates rendered envs; otherwise
+        vectorized envs overlap visually. Apply it to both camera rendering and GUI viewing.
+        """
+        if self._enable_rendering or self._show_gui or self._render_envs_idx_arg is not None:
+            return gs.options.vis.VisOptions(env_separate_rigid=True, rendered_envs_idx=self._rendered_envs_idx,
+                                             **self._vis_options_override)
+        return gs.options.vis.VisOptions(**self._vis_options_override)
 
     def _cache_original_model_params(self):
         """Cache the nominal per-link / per-dof model parameters right after build, so model
