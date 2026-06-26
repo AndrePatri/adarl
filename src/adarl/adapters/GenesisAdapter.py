@@ -267,6 +267,11 @@ class GenesisAdapter(BaseVecSimulationAdapter, BaseVecJointEffortAdapter):
         camera_defs = kwargs.pop("cameras", None)
         if camera_defs is not None:
             self._camera_defs = list(camera_defs)
+        # optional heightfield terrain (replaces the flat ground plane when provided). A plain dict so
+        # this adapter stays decoupled from the AugMPCEnvs terrain utilities. Keys: 'height_field' (2D
+        # array), 'horizontal_scale', 'vertical_scale', optional 'pos' (3,), 'friction', 'vis_mode',
+        # 'visualize_contact', 'name'.
+        terrain_spec = kwargs.pop("terrain", None)
         if self._enable_rendering:
             if self._use_batch_renderer:
                 ggLog.info(f"GenesisAdapter: using BatchRenderer with use_rasterizer={not self._use_raytracer}")
@@ -287,7 +292,10 @@ class GenesisAdapter(BaseVecSimulationAdapter, BaseVecJointEffortAdapter):
                                show_FPS=False)
         self._entities = {}
         ground_entity = None
-        if self._add_ground:
+        if terrain_spec is not None:
+            ground_entity = self._add_terrain(terrain_spec)
+            self._entities["terrain"] = ground_entity
+        elif self._add_ground:
             ground_entity = self._scene.add_entity(gs.morphs.Plane(), name="ground")
         self._tmp_dir = tempfile.mkdtemp(prefix="GenesisAdapter_models_")
         parsed_cam_specs: list[_ParsedCameraSpec] = []
@@ -465,6 +473,111 @@ class GenesisAdapter(BaseVecSimulationAdapter, BaseVecJointEffortAdapter):
                                            T_world_body=T_spawn @ T_model_body,
                                            attach_to_entity_link=not camera_only))
         return specs, camera_only
+
+    def _add_terrain(self, spec: dict) -> Any:
+        """Add a terrain from a backend-neutral dict spec. Two collision representations:
+
+        - ``boxes`` (N,6 world [cx,cy,cz,sx,sy,sz]): spawn one fixed gs.morphs.Box per row (cheap,
+          crisp box colliders -- mirrors isaac's *_prim terrains). Boxes get contype/conaffinity that
+          let them collide with the robot (default 0xFFFF masks) but NOT each other, so a dense box
+          field doesn't flood the narrowphase pair budget.
+        - ``height_field`` (2D): one gs.morphs.Terrain (mesh + auto-SDF). cell (i,j) lands at
+          ``pos + (i*horizontal_scale, j*horizontal_scale, height_field[i,j]*vertical_scale)``.
+        """
+        import numpy as _np
+        if spec.get("boxes", None) is not None:
+            return self._add_box_terrain(spec)
+        hf = _np.asarray(spec["height_field"])
+        surface = self._terrain_surface(spec)
+        if hf.ndim != 2:
+            raise ValueError(f"terrain height_field must be 2D, got shape {hf.shape}")
+        pos = tuple(float(v) for v in spec.get("pos", (0.0, 0.0, 0.0)))
+        morph = gs.morphs.Terrain(height_field=hf,
+                                  horizontal_scale=float(spec["horizontal_scale"]),
+                                  vertical_scale=float(spec["vertical_scale"]),
+                                  pos=pos,
+                                  collision=True,
+                                  visualization=True)
+        material = None
+        friction = spec.get("friction", None)
+        if friction is not None:
+            # genesis Rigid friction is a single coefficient in [0.01, 5.0] (no static/dynamic split).
+            material = gs.materials.Rigid(friction=float(min(max(friction, 0.01), 5.0)))
+        add_kwargs: dict[str, Any] = {}
+        vis_mode = spec.get("vis_mode", None)
+        if vis_mode is not None:
+            add_kwargs["vis_mode"] = vis_mode
+        if spec.get("visualize_contact", False):
+            add_kwargs["visualize_contact"] = True
+        return self._scene.add_entity(morph, material=material, surface=surface,
+                                      name=spec.get("name", "terrain"), **add_kwargs)
+
+    def _terrain_surface(self, spec: dict) -> Any:
+        """Build a gs.surfaces.Default with a solid color from spec['color'] (RGB or RGBA, 0..1),
+        or None to use the genesis default surface."""
+        color = spec.get("color", None)
+        if color is None:
+            return None
+        return gs.surfaces.Default(color=tuple(float(c) for c in color))
+
+    def _add_box_terrain(self, spec: dict) -> Any:
+        """Spawn the terrain as a set of fixed primitive boxes (one entity per box)."""
+        import numpy as _np
+        boxes = _np.asarray(spec["boxes"], dtype=float).reshape(-1, 6)
+        friction = spec.get("friction", None)
+        material = (gs.materials.Rigid(friction=float(min(max(friction, 0.01), 5.0)))
+                    if friction is not None else None)
+        surface = self._terrain_surface(spec)
+        add_kwargs: dict[str, Any] = {}
+        vis_mode = spec.get("vis_mode", None)
+        if vis_mode is not None:
+            add_kwargs["vis_mode"] = vis_mode
+        if spec.get("visualize_contact", False):
+            add_kwargs["visualize_contact"] = True
+        # contype/conaffinity (MuJoCo rule: collide iff contype_a & conaffinity_b or vice-versa). Terrain
+        # boxes collide with the robot (default masks 0xFFFF) but not with each other.
+        contype = int(spec.get("box_contype", 0x0002))
+        conaffinity = int(spec.get("box_conaffinity", 0x0001))
+        base_name = spec.get("name", "terrain")
+        self._terrain_box_entities = []
+        first = None
+        for i, b in enumerate(boxes):
+            cx, cy, cz, sx, sy, sz = (float(v) for v in b)
+            if sx <= 0.0 or sy <= 0.0 or sz <= 0.0:
+                continue
+            ent = self._scene.add_entity(
+                gs.morphs.Box(pos=(cx, cy, cz), size=(sx, sy, sz), fixed=True,
+                              collision=True, visualization=True,
+                              contype=contype, conaffinity=conaffinity),
+                material=material, surface=surface, name=f"{base_name}_box_{i}", **add_kwargs)
+            self._terrain_box_entities.append(ent)
+            if first is None:
+                first = ent
+        return first
+
+    def terrain_entity(self) -> Any:
+        """Return the terrain entity (first box, or the heightfield entity) if one was spawned."""
+        return self._entities.get("terrain", None)
+
+    def draw_debug_spheres(self, poss, radius: float = 0.01, color=(1.0, 0.0, 0.0, 0.5)) -> Any:
+        """Draw debug spheres at world positions ``poss`` (M,3). No-op (returns None) when there is no
+        active visualizer (headless without cameras). Returns a handle for clear_debug_object()."""
+        if self._scene is None or getattr(self._scene, "visualizer", None) is None:
+            return None
+        try:
+            return self._scene.draw_debug_spheres(poss=poss, radius=radius, color=color)
+        except Exception as e:
+            ggLog.warn(f"GenesisAdapter.draw_debug_spheres failed: {e}")
+            return None
+
+    def clear_debug_object(self, obj: Any) -> None:
+        """Remove a previously drawn debug object (from draw_debug_spheres). Safe if obj is None."""
+        if obj is None or self._scene is None:
+            return
+        try:
+            self._scene.clear_debug_object(obj)
+        except Exception:
+            pass
 
     def _add_model(self, model: ModelSpawnDef) -> tuple[Any, list[_ParsedCameraSpec]]:
         if model.attachment_link is not None:
