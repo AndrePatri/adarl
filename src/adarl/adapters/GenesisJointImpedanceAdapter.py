@@ -110,6 +110,7 @@ class GenesisJointImpedanceAdapter(GenesisAdapter, BaseVecJointImpedanceAdapter)
                  genesis_logging_level: str = "info",
                  log_folder: str = "./",
                  use_batch_renderer: bool = False,
+                 render_lights: list | None = None,
                  default_max_joint_impedance_ctrl_torque: float = 100.0,
                  max_joint_impedance_ctrl_torques: dict[tuple[str, str], float] | None = None,
                  reference_filter_mode: str = "second_order",
@@ -134,7 +135,8 @@ class GenesisJointImpedanceAdapter(GenesisAdapter, BaseVecJointImpedanceAdapter)
                          vis_options_override=vis_options_override,
                          genesis_logging_level=genesis_logging_level,
                          log_folder=log_folder,
-                         use_batch_renderer=use_batch_renderer)
+                         use_batch_renderer=use_batch_renderer,
+                         render_lights=render_lights)
         if reference_filter_mode not in ("second_order", "exponential", "none"):
             raise RuntimeError(f"Unknown reference filter mode '{reference_filter_mode}'")
         self._max_torque_default = default_max_joint_impedance_ctrl_torque

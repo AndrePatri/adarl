@@ -192,7 +192,8 @@ class GenesisAdapter(BaseVecSimulationAdapter, BaseVecJointEffortAdapter):
                  genesis_logging_level: str = "info",
                  enable_model_randomization: bool = True,
                  log_folder: str = "./",
-                 use_batch_renderer: bool = False):
+                 use_batch_renderer: bool = False,
+                 render_lights: list | None = None):
         super().__init__(vec_size=vec_size, output_th_device=output_th_device)
         ensure_genesis_initialized(output_th_device, genesis_logging_level)
         self._sim_step_dt = float(sim_step_dt)
@@ -208,6 +209,7 @@ class GenesisAdapter(BaseVecSimulationAdapter, BaseVecJointEffortAdapter):
         self._sim_options_override = dict(sim_options_override) if sim_options_override else {}
         self._rigid_options_override = dict(rigid_options_override) if rigid_options_override else {}
         self._vis_options_override = dict(vis_options_override) if vis_options_override else {}
+        self._render_lights = list(render_lights) if render_lights else None
         self._log_folder = log_folder
         self._sim_step_dt_th = th.as_tensor(self._sim_step_dt, device=self._out_th_device)
 
@@ -1091,14 +1093,32 @@ class GenesisAdapter(BaseVecSimulationAdapter, BaseVecJointEffortAdapter):
             with lock:
                 context.rendered_envs_idx = list(new_idx)
 
+    def _make_lights(self, specs: list) -> list:
+        """Convert backend-neutral light dicts to genesis vis light objects.
+        Each dict: {'type': 'point'|'directional', 'pos'|'dir': [x,y,z], 'color': [r,g,b], 'intensity': f}."""
+        vis = gs.options.vis
+        lights = []
+        for s in specs:
+            color = tuple(s.get("color", (1.0, 1.0, 1.0)))
+            intensity = float(s.get("intensity", 5.0))
+            if s.get("type", "directional") == "point":
+                lights.append(vis.PointLight(pos=tuple(s["pos"]), color=color, intensity=intensity))
+            else:
+                lights.append(vis.DirectionalLight(dir=tuple(s.get("dir", (-1, -1, -1))),
+                                                   color=color, intensity=intensity))
+        return lights
+
     def _build_vis_options(self):
         """Visualization options. env_separate_rigid isolates rendered envs; otherwise
         vectorized envs overlap visually. Apply it to both camera rendering and GUI viewing.
         """
+        overrides = dict(self._vis_options_override)
+        if self._render_lights and "lights" not in overrides:
+            overrides["lights"] = self._make_lights(self._render_lights)
         if self._enable_rendering or self._show_gui or self._render_envs_idx_arg is not None:
             return gs.options.vis.VisOptions(env_separate_rigid=True, rendered_envs_idx=self._rendered_envs_idx,
-                                             **self._vis_options_override)
-        return gs.options.vis.VisOptions(**self._vis_options_override)
+                                             **overrides)
+        return gs.options.vis.VisOptions(**overrides)
 
     def _cache_original_model_params(self):
         """Cache the nominal per-link / per-dof model parameters right after build, so model
