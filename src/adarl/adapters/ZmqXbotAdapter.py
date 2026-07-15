@@ -221,8 +221,10 @@ class ZmqXbotAdapter(StandaloneRealAdapter, BaseJointImpedanceAdapter, BaseJoint
         return plugin_running and not self._is_safety_triggered and state_fresh
 
     def _update_safety_status(self, timeout_s: float | None = None) -> bool:
+        # `safety_triggered` now comes from the single `health` service (the separate
+        # `safety_status` service was folded into it server-side).
         try:
-            status = self._xbot_zmq_client.get_safety_status(
+            status = self._xbot_zmq_client.get_health(
                 timeout_s=self._health_check_timeout_s if timeout_s is None else timeout_s
             )
         except Exception:
