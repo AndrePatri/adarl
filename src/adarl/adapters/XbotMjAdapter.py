@@ -463,7 +463,12 @@ class XbotMjAdapter(ZmqXbotAdapter, BaseSimulationAdapter):
             return self._last_health_ok
 
         try:
-            health = self._xbot_zmq_client.get_health(timeout_s=self._health_check_timeout_s)
+            health = self._xbot_zmq_client.get_status(timeout_s=self._health_check_timeout_s)
+            self._is_safety_triggered = bool(health.get("safety_triggered", True))
+            plugin_running = bool(health.get("zmq_io_state_ok", False)) and health.get("zmq_io_state") == "Running"
+            self._last_health_ok = plugin_running and not self._is_safety_triggered
+            self._health_cache_until = now + self._xmj_control_health_period_s
+            return self._last_health_ok
         except Exception:
             # XMJ owns the simulator clock and xbot2-core can legitimately be
             # blocked waiting for manual stepping. A health-service timeout is
@@ -472,11 +477,6 @@ class XbotMjAdapter(ZmqXbotAdapter, BaseSimulationAdapter):
             self._health_cache_until = now + self._xmj_control_health_period_s
             return self._last_health_ok
 
-        self._is_safety_triggered = bool(health.get("safety_triggered", True))
-        plugin_running = bool(health.get("zmq_io_state_ok", False)) and health.get("zmq_io_state") == "Running"
-        self._last_health_ok = plugin_running and not self._is_safety_triggered
-        self._health_cache_until = now + self._xmj_control_health_period_s
-        return self._last_health_ok
 
     def is_xbot_control_running(self):
         return self.is_xbot_running() and not self._is_safety_triggered

@@ -207,13 +207,11 @@ class ZmqXbotAdapter(StandaloneRealAdapter, BaseJointImpedanceAdapter, BaseJoint
         return float(getattr(self._xbot_zmq_client, "_last_msg_stamp", 0.0))
 
     def _check_zmq_plugin(self, timeout_s: float | None = None) -> bool:
-        try:
-            health = self._xbot_zmq_client.get_health(
-                timeout_s=self._health_check_timeout_s if timeout_s is None else timeout_s
-            )
-        except Exception:
-            return False
-
+        # Let ZMQ / service errors surface: a failed health poll is a real problem (dead plugin,
+        # renamed service, transport down), not something to mask by silently returning False.
+        health = self._xbot_zmq_client.get_status(
+            timeout_s=self._health_check_timeout_s if timeout_s is None else timeout_s
+        )
         self._is_safety_triggered = bool(health.get("safety_triggered", True))
         plugin_running = bool(health.get("zmq_io_state_ok", False)) and health.get("zmq_io_state") == "Running"
         state_age = float(health.get("state_last_publish_age_s", float("inf")))
@@ -221,14 +219,11 @@ class ZmqXbotAdapter(StandaloneRealAdapter, BaseJointImpedanceAdapter, BaseJoint
         return plugin_running and not self._is_safety_triggered and state_fresh
 
     def _update_safety_status(self, timeout_s: float | None = None) -> bool:
-        # `safety_triggered` now comes from the single `health` service (the separate
-        # `safety_status` service was folded into it server-side).
-        try:
-            status = self._xbot_zmq_client.get_health(
-                timeout_s=self._health_check_timeout_s if timeout_s is None else timeout_s
-            )
-        except Exception:
-            return self._is_safety_triggered
+        # `safety_triggered` comes from the single `status` service. Errors surface (no swallowing):
+        # if the safety poll fails we must not silently keep the stale value.
+        status = self._xbot_zmq_client.get_status(
+            timeout_s=self._health_check_timeout_s if timeout_s is None else timeout_s
+        )
         self._is_safety_triggered = bool(status.get("safety_triggered", True))
         return self._is_safety_triggered
 
